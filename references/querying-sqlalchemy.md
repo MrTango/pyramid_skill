@@ -602,7 +602,104 @@ def test_recent_posts_is_two_queries(dbsession):
 
 ---
 
-## 13. Best-practices checklist
+## 13. Deferred execution & async
+
+### 13.1 Never run queries at import / config time
+
+Statement construction is **lazy** — building a `select()` does not touch the
+database. Execution only happens when you call `execute()` / `scalars()` /
+`scalar()` on a session. Keep it that way: **no query should run at module import,
+at `Configurator` setup, or from a module-global session.**
+
+```python
+# BAD — runs at import; no request, no transaction, connects too early,
+#       and the result is frozen for the life of the process.
+from .models import Session, User          # a module-global Session
+ADMINS = Session().scalars(select(User).where(User.is_admin)).all()   # <-- executes on import!
+
+# BAD — query at Configurator/main() time.
+def main(global_config, **settings):
+    engine = get_engine(settings)
+    engine.execute(text("SELECT 1"))        # don't hit the DB while wiring the app
+
+# GOOD — a deferred function that runs per request, against request.dbsession.
+def admins(dbsession):
+    return dbsession.scalars(select(User).where(User.is_admin.is_(True))).all()
+```
+
+Why this matters in Pyramid specifically:
+
+- Views/queries must run **inside** the request so `pyramid_tm` owns the transaction
+  and `request.dbsession` is the right request-scoped session. A query at import
+  time has neither.
+- `engine_from_config()` / `get_engine()` build an engine but **do not connect** —
+  connections are opened lazily on first use. So creating the engine in `main()` is
+  fine; *querying* through it there is not.
+- Schema creation (`Base.metadata.create_all`) belongs in the `initialize_db`
+  script or test fixtures — never at import.
+- Query helpers take `dbsession` as an argument (§12.1); they don't close over a
+  global session. This is what makes them safe to import and easy to test.
+
+Rule of thumb: **importing any module in your package must not emit SQL.** If it
+does, you have a query executing at import time — move it into a function.
+
+### 13.2 Async SQLAlchemy and Pyramid — read this before reaching for it
+
+**Pyramid 2.x is a WSGI, synchronous framework.** Its router invokes view callables
+synchronously — there is no native `async def` view support — and the standard data
+stack (`pyramid_tm` + `zope.sqlalchemy` + `request.dbsession`) is **sync-only**. It
+does **not** drive a SQLAlchemy `AsyncSession`. So the patterns everywhere else in
+this file (sync `request.dbsession`) are the supported, recommended path for Pyramid.
+
+If you genuinely need SQLAlchemy's asyncio API, understand the trade-offs:
+
+- You **lose the pyramid_tm / zope.sqlalchemy integration** and must open, commit,
+  rollback, and close the `AsyncSession` yourself (no automatic per-request
+  transaction, no `pyramid_retry` on the async session).
+- Pyramid can't `await` a view, so you bridge one of two ways, both with costs:
+  1. Run the coroutine from a sync view with `anyio.from_thread` / a persistent
+     event loop (a per-request `asyncio.run()` spins up and tears down a loop every
+     request — avoid). Under a threaded WSGI server (waitress) this blocks a worker
+     thread anyway, so you get async SQLAlchemy's API but **not** its concurrency win.
+  2. Serve the app under ASGI (e.g. wrap with `a2wsgi`), which still doesn't make
+     Pyramid views awaitable — it just changes the server protocol.
+- **Lazy loading does not work under async** — accessing an unloaded relationship
+  raises. You must eager-load (`selectinload`/`joinedload`) every relationship, use
+  `AsyncAttrs` (`await obj.awaitable_attrs.rel`), or `await session.refresh(obj, [...])`.
+
+Sketch, if you accept all of the above (note: transactions are manual, not pyramid_tm):
+
+```python
+from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
+from sqlalchemy.orm import selectinload
+
+engine = create_async_engine(settings["sqlalchemy.url"])   # e.g. postgresql+asyncpg://...
+AsyncSession = async_sessionmaker(engine, expire_on_commit=False)
+
+async def recent_posts(limit=20):
+    async with AsyncSession() as session:      # you manage the lifecycle/txn here
+        result = await session.scalars(
+            select(Post)
+            .options(selectinload(Post.tags))   # MUST eager-load; no lazy under async
+            .order_by(Post.created.desc())
+            .limit(limit)
+        )
+        return result.all()
+```
+
+Note the async engine/sessionmaker above are created **at module load, but no query
+runs** — §13.1 still holds. The first SQL is emitted only inside `recent_posts()`.
+
+Practical guidance: **for a Pyramid app, stay synchronous** with `request.dbsession`
+and let `pyramid_tm` manage transactions. If your workload is genuinely async-first
+(lots of concurrent I/O-bound calls), that's a signal to use an async-native
+framework (FastAPI/Starlette) rather than bolting `AsyncSession` onto WSGI Pyramid.
+Reserve async in Pyramid for isolated, self-managed tasks (e.g. a background script)
+where you own the event loop and the session lifecycle.
+
+---
+
+## 14. Best-practices checklist
 
 - [ ] 2.0 `select()` + `session.scalars()/execute()`; not legacy `session.query()`.
 - [ ] Primary-key lookups via `session.get(Model, pk)`.
@@ -621,3 +718,8 @@ def test_recent_posts_is_two_queries(dbsession):
 - [ ] Query logic lives in a query module / model methods, not inline in views.
 - [ ] `request.params`/`matchdict` values validated & coerced before hitting a query.
 - [ ] List queries filter by principal in SQL for row-level auth (not in Python).
+- [ ] No SQL emitted at import / `main()` time — queries run only inside a request
+      via `request.dbsession` (statements are built lazily, executed on demand).
+- [ ] Async (`AsyncSession`) used only with eyes open: Pyramid is WSGI/sync, so it
+      bypasses `pyramid_tm`/`zope.sqlalchemy` and needs manual transaction handling
+      and mandatory eager loading — default to sync `request.dbsession`.
