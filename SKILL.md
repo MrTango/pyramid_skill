@@ -35,7 +35,7 @@ templating, persistence, and security.
 | The `Configurator`, imperative vs declarative config, `include`/`includeme`, `.ini` wiring, settings | `references/configuration.md` |
 | Routes/URL dispatch, traversal, view callables, renderers, templates, static assets | `references/views-and-routing.md` |
 | SQLAlchemy models, sessions, `pyramid_tm` transactions, migrations, request methods | `references/models-and-data.md` |
-| Writing SQLAlchemy **queries** (2.0 `select()`, joins, eager loading / N+1, pagination, aggregates, bulk writes) & query best practices | `references/querying-sqlalchemy.md` |
+| Writing SQLAlchemy **queries in a Pyramid app** (2.0 `select()`, joins, eager loading / N+1, pagination, aggregates, bulk writes; plus Pyramid integration: query modules, request methods, view/traversal patterns, row-level auth, query testing) | `references/querying-sqlalchemy.md` |
 | Security policy, authentication, authorization/ACLs, permissions, CSRF, sessions | `references/security.md` |
 | Unit + functional tests with `pytest`, `DummyRequest`, `testapp`/webtest | `references/testing.md` |
 | production.ini, waitress/gunicorn, nginx reverse proxy, systemd, Docker, logging | `references/deployment.md` |

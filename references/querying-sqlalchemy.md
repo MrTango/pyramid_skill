@@ -399,7 +399,210 @@ signature of an N+1 you should fix with `selectinload`/`joinedload`. Use the
 
 ---
 
-## 12. Best-practices checklist
+## 12. Pyramid integration patterns (querying *in* a Pyramid app)
+
+This is the part that ties SQLAlchemy to Pyramid. The pieces:
+`request.dbsession` (request-scoped session), `pyramid_tm` (one transaction per
+request), `config.scan()` views, renderers, routes, and — optionally — traversal.
+
+### 12.1 Keep views thin: put queries in a query module
+
+Don't scatter `select()` statements across view functions. Centralize them so they
+are reusable, unit-testable, and easy to optimize (add eager-loading in one place).
+
+```python
+# myproject/queries.py  — pure functions: (dbsession, params) -> data
+from sqlalchemy import select, func
+from sqlalchemy.orm import selectinload
+from .models import Post
+
+
+def recent_posts(dbsession, limit=20):
+    return dbsession.scalars(
+        select(Post)
+        .options(selectinload(Post.tags))       # eager-load once, here
+        .order_by(Post.created.desc())
+        .limit(limit)
+    ).all()
+
+
+def post_by_slug(dbsession, slug):
+    return dbsession.scalars(
+        select(Post).where(Post.slug == slug)
+    ).one_or_none()
+
+
+def post_count(dbsession):
+    return dbsession.scalar(select(func.count()).select_from(Post))
+```
+
+```python
+# myproject/views/blog.py — the view just wires HTTP <-> queries <-> renderer
+from pyramid.view import view_config
+from pyramid.httpexceptions import HTTPNotFound
+from .. import queries
+
+
+@view_config(route_name="blog", renderer="myproject:templates/blog.jinja2")
+def blog(request):
+    return {"posts": queries.recent_posts(request.dbsession)}
+
+
+@view_config(route_name="post", renderer="myproject:templates/post.jinja2")
+def post(request):
+    obj = queries.post_by_slug(request.dbsession, request.matchdict["slug"])
+    if obj is None:
+        raise HTTPNotFound()
+    return {"post": obj}
+```
+
+Views stay trivial; the query layer is where you tune SQL and prevent N+1.
+
+### 12.2 Expose queries as `request` methods (optional, ergonomic)
+
+For queries you use everywhere, attach a helper to the request alongside
+`request.dbsession`, in your models/queries `includeme`:
+
+```python
+def includeme(config):
+    config.add_request_method(
+        lambda request: request.dbsession.get(User, request.authenticated_userid),
+        "user",
+        reify=True,          # computed once per request, then cached
+    )
+```
+
+Now any view/template can use `request.user` (one query per request, cached).
+`reify=True` is the key: it memoizes the result for the life of the request.
+
+### 12.3 End-to-end list view with pagination + `route_url`
+
+```python
+# queries.py
+def posts_page(dbsession, page, per_page=20):
+    total = dbsession.scalar(select(func.count()).select_from(Post))
+    items = dbsession.scalars(
+        select(Post).order_by(Post.created.desc())
+        .limit(per_page).offset((page - 1) * per_page)
+    ).all()
+    return items, total
+```
+
+```python
+# views/blog.py
+@view_config(route_name="blog", renderer="myproject:templates/blog.jinja2")
+def blog(request):
+    page = max(1, int(request.params.get("page", 1)))
+    items, total = queries.posts_page(request.dbsession, page)
+    return {
+        "posts": items,
+        "page": page,
+        "has_next": page * 20 < total,
+        # build URLs with route_url, never hardcode:
+        "next_url": request.route_url("blog", _query={"page": page + 1}),
+    }
+```
+
+Coerce/validate `request.params` (they are strings and user-controlled) *before*
+they reach a query — `int(...)` in a `try`, clamp ranges, whitelist sort columns.
+
+### 12.4 Traversal: make the DB row the `context`
+
+In a traversal app, a resource factory loads the object by id; the loaded ORM
+object becomes `request.context`, and a missing row is a natural 404. This puts the
+query at the edge and lets views/ACLs work on the object directly.
+
+```python
+# resources.py
+from pyramid.httpexceptions import HTTPNotFound
+from .models import Post
+
+
+class PostResource:
+    def __init__(self, request):
+        self.request = request
+
+    def __getitem__(self, key):
+        post = self.request.dbsession.get(Post, int(key))   # /posts/{id}
+        if post is None:
+            raise HTTPNotFound()
+        post.__parent__ = self          # location-aware -> ACL inheritance works
+        post.__name__ = key
+        return post
+```
+
+```python
+# a view matched on the loaded context type — no re-query needed
+@view_config(context=Post, renderer="myproject:templates/post.jinja2")
+def post_view(context, request):
+    return {"post": context}           # context IS the Post row
+```
+
+Use this when objects form a tree and you want per-object security (§12.5); use
+plain URL-dispatch + a query module (§12.1) otherwise.
+
+### 12.5 Row-level authorization: filter querysets by principal
+
+Object permissions come from ACLs (see `references/security.md`), but *list*
+queries must be filtered in SQL — never load everything and filter in Python.
+Push the security predicate into the `WHERE` clause:
+
+```python
+def visible_posts(dbsession, request):
+    stmt = select(Post).order_by(Post.created.desc())
+    if "group:editors" not in request.effective_principals:
+        stmt = stmt.where(Post.published.is_(True))     # non-editors see only published
+    if uid := request.authenticated_userid:
+        stmt = stmt.where(or_(Post.published.is_(True), Post.author_id == uid))
+    return dbsession.scalars(stmt).all()
+```
+
+This keeps authorization and pagination consistent (you can't paginate correctly if
+you filter after the query).
+
+### 12.6 Transactions & retries — recap for query code
+
+- The session is committed by `pyramid_tm` at request end; **don't** `commit()`.
+  `flush()` only when you need a generated id mid-request (§8).
+- With `pyramid_retry` enabled, a view (and its queries/writes) may run **more than
+  once** on a transient DB conflict. Keep the view idempotent; do external side
+  effects (emails, payments) *after* the DB work commits, e.g. from a
+  `transaction` after-commit hook, not inline.
+
+### 12.7 Debugging & testing queries in Pyramid
+
+- **pyramid_debugtoolbar** → "SQLAlchemy" panel shows every statement, params, and
+  count for the request — the fastest way to spot an N+1 in a real view.
+- **`pshell development.ini`** drops you into a shell with `request` and the app
+  registry loaded, so you can iterate on `select()` statements against the real DB.
+- **Tests** use the starter's `dbsession`/`tm` fixtures (transaction rolled back per
+  test — see `references/testing.md`). Test query functions directly, and assert
+  query *counts* to lock in N+1 fixes:
+
+```python
+def test_recent_posts_is_two_queries(dbsession):
+    from sqlalchemy import event
+    from myproject import queries
+    dbsession.add_all([Post(title=f"p{i}", slug=str(i)) for i in range(5)])
+    dbsession.flush()
+
+    count = 0
+    engine = dbsession.get_bind()
+
+    @event.listens_for(engine, "before_cursor_execute")
+    def _(*a, **k):
+        nonlocal count
+        count += 1
+
+    posts = queries.recent_posts(dbsession)         # selectinload tags
+    for p in posts:                                  # touch the relationship
+        _ = p.tags
+    assert count <= 2                                # 1 for posts + 1 selectin, no N+1
+```
+
+---
+
+## 13. Best-practices checklist
 
 - [ ] 2.0 `select()` + `session.scalars()/execute()`; not legacy `session.query()`.
 - [ ] Primary-key lookups via `session.get(Model, pk)`.
@@ -415,4 +618,6 @@ signature of an N+1 you should fix with `selectinload`/`joinedload`. Use the
 - [ ] Indexes exist for every column used in `WHERE`/`ORDER BY`/join keys.
 - [ ] SQL logging or the debugtoolbar checked for query count/latency before shipping.
 - [ ] Bulk `update()`/`delete()` for set-based changes instead of per-row loops.
-```
+- [ ] Query logic lives in a query module / model methods, not inline in views.
+- [ ] `request.params`/`matchdict` values validated & coerced before hitting a query.
+- [ ] List queries filter by principal in SQL for row-level auth (not in Python).
