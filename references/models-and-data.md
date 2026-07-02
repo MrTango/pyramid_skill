@@ -97,16 +97,23 @@ Index("my_index", MyModel.name, unique=True, mysql_length=255)
 
 ## Using it in a view
 
+> For anything beyond a trivial lookup — joins, filtering, eager loading to avoid
+> N+1, pagination, aggregates, bulk writes — see the dedicated deep-dive in
+> **`references/querying-sqlalchemy.md`**. Prefer the SQLAlchemy **2.0 `select()`
+> style** shown there over the legacy `session.query(...)` API.
+
 ```python
 from pyramid.view import view_config
 from pyramid.httpexceptions import HTTPNotFound
+from sqlalchemy import select
 from ..models import MyModel
 
 
 @view_config(route_name="thing", renderer="json")
 def thing(request):
-    obj = request.dbsession.query(MyModel).filter_by(
-        id=request.matchdict["id"]
+    # 2.0 style; session.get(MyModel, id) is even better for a PK lookup.
+    obj = request.dbsession.scalars(
+        select(MyModel).where(MyModel.id == request.matchdict["id"])
     ).one_or_none()
     if obj is None:
         raise HTTPNotFound()

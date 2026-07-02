@@ -15,6 +15,7 @@ demand:
 | `references/configuration.md` | `Configurator`, imperative vs declarative config, `include`/`includeme`, settings, PasteDeploy `.ini` |
 | `references/views-and-routing.md` | URL dispatch, traversal, view callables, renderers, templates, static assets, events, error views |
 | `references/models-and-data.md` | SQLAlchemy + `pyramid_tm` + `zope.sqlalchemy`, `request.dbsession`, Alembic migrations, console scripts |
+| `references/querying-sqlalchemy.md` | Deep dive: SQLAlchemy 2.0 `select()` queries, joins, eager loading / N+1, pagination, aggregates, bulk writes, and query best practices |
 | `references/security.md` | Pyramid 2.x `ISecurityPolicy`, authentication, ACLs/permissions, CSRF, sessions |
 | `references/testing.md` | `pytest`, `testing.setUp`/`DummyRequest`, `webtest` functional tests, transaction-rollback fixtures |
 | `references/deployment.md` | `production.ini`, waitress/gunicorn, nginx, systemd, Docker, release checklist |
